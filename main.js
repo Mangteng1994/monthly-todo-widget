@@ -173,6 +173,7 @@
   function textFromBlock(block) {
     const raw = block.markdown || block.content || "";
     return raw
+      .replace(/^\s*>\s*/, "")
       .replace(/^\s*[-*+]\s+/, "")
       .replace(/^\s*\d+\.\s+/, "")
       .replace(/^\s*\[[ xX]\]\s+/, "")
@@ -197,6 +198,10 @@
     return `- [${checked ? "x" : " "}] ${String(text || "").trim()}`;
   }
 
+  function markdownForListItem(text) {
+    return `- ${String(text || "").trim()}`;
+  }
+
   function parseLinkedBlockId(markdown, sourceId) {
     const text = String(markdown || "");
     const patterns = [
@@ -218,7 +223,8 @@
   }
 
   function flattenTodoItems(blocks) {
-    const items = [];
+    const listItems = [];
+    const fallbackItems = [];
     const seenIds = new Set();
     const seenTexts = new Set();
 
@@ -230,8 +236,13 @@
       return block.type === "i";
     }
 
-    function addItem(block, task) {
-      const text = textFromBlock(block);
+    function isBlockQuote(block) {
+      return /^\s*>/.test(block.markdown || block.content || "");
+    }
+
+    function addItem(block, textBlock, target) {
+      const textBlocks = Array.isArray(textBlock) ? textBlock : [textBlock || block];
+      const text = textBlocks.map(textFromBlock).filter(Boolean).join("\n");
       if (!text) {
         return;
       }
@@ -245,17 +256,21 @@
         seenIds.add(block.id);
       }
       seenTexts.add(textKey);
-      items.push({
+      target.push({
         sourceId: block.id,
         sourceText: text,
-        sourceMarkdown: block.markdown || block.content || "",
-        sourceTask: task || isTaskMarkdown(block.markdown),
+        sourceMarkdown: [block.markdown || block.content || ""]
+          .concat(textBlocks.map((item) => item.markdown || item.content || ""))
+          .filter(Boolean)
+          .join("\n"),
+        sourceTask: isTaskMarkdown(block.markdown || block.content || ""),
+        sourceChecked: isTaskChecked(block.markdown || block.content || ""),
       });
     }
 
     function directTextChildren(block) {
       return (block.children || []).filter((child) => {
-        return !isUnorderedList(child) && !isListItem(child) && textFromBlock(child);
+        return !isUnorderedList(child) && !isListItem(child) && !isBlockQuote(child) && textFromBlock(child);
       });
     }
 
@@ -271,13 +286,7 @@
         if (isListItem(block)) {
           if (parentIsUnorderedList) {
             const textChildren = directTextChildren(block);
-            if (textChildren.length) {
-              for (const child of textChildren) {
-                addItem(child, true);
-              }
-            } else {
-              addItem(block, true);
-            }
+            addItem(block, textChildren.length ? textChildren : block, listItems);
 
             walk(
               (block.children || []).filter((child) => isUnorderedList(child)),
@@ -289,9 +298,8 @@
           continue;
         }
 
-        if (text) {
-          addItem(block, false);
-          continue;
+        if (text && !parentIsUnorderedList && !isBlockQuote(block)) {
+          addItem(block, block, fallbackItems);
         }
 
         walk(block.children || [], false);
@@ -299,7 +307,7 @@
     }
 
     walk(blocks || [], false);
-    return items;
+    return listItems.length ? listItems : fallbackItems;
   }
 
   function dedupeTodoItems(items) {
@@ -350,8 +358,21 @@
       text: task ? taskTextFromMarkdown(markdown) : textFromBlock(block),
       checked: task && isTaskChecked(markdown),
       task,
+      markdownKind: task ? "task" : "plain",
       editable: block.type !== "d",
       openId: block.id,
+    };
+  }
+
+  function createUnboundRow(sourceItem) {
+    return {
+      id: sourceItem.sourceId,
+      text: sourceItem.sourceText,
+      checked: sourceItem.sourceChecked,
+      task: true,
+      markdownKind: sourceItem.sourceTask ? "task" : "list",
+      editable: true,
+      openId: sourceItem.sourceId,
     };
   }
 
@@ -364,7 +385,7 @@
         broken: true,
         targetId,
         title: "任务链接失效",
-        rows: [],
+        rows: [createUnboundRow(sourceItem)],
       };
     }
 
@@ -402,17 +423,8 @@
         bound: false,
         broken: false,
         targetId: "",
-        title: "未绑定任务笔记",
-        rows: [
-          {
-            id: sourceItem.sourceId,
-            text: sourceItem.sourceText,
-            task: false,
-            checked: false,
-            editable: false,
-            openId: sourceItem.sourceId,
-          },
-        ],
+        title: sourceItem.sourceText,
+        rows: [createUnboundRow(sourceItem)],
       };
     }
 
@@ -426,7 +438,7 @@
         targetId,
         title: "任务读取失败",
         error: error.message,
-        rows: [],
+        rows: [createUnboundRow(sourceItem)],
       };
     }
   }
@@ -514,9 +526,8 @@
     return `${sourceId || ""}:${rowId || ""}`;
   }
 
-  function renderTodoItem(item) {
-    const sourceLink = blockLink(item.source.sourceId);
-    const rows = item.rows
+  function renderTaskRows(item, rows, options) {
+    return rows
       .map((row) => {
         const key = rowKey(item.source.sourceId, row.id);
         state.rowMap.set(key, { item, row });
@@ -525,19 +536,30 @@
           ? `<input class="task-checkbox" type="checkbox" data-row-key="${escapeHtml(key)}" ${row.checked ? "checked" : ""}>`
           : '<span class="task-checkbox-spacer" aria-hidden="true"></span>';
         const text = row.editable
-          ? `<span class="task-text" contenteditable="true" spellcheck="false" data-row-key="${escapeHtml(key)}">${escapeHtml(row.text)}</span>`
-          : `<span class="task-text task-text--readonly">${escapeHtml(row.text)}</span>`;
+          ? `<span class="${options.textClass}" contenteditable="true" spellcheck="false" data-row-key="${escapeHtml(key)}">${escapeHtml(row.text)}</span>`
+          : `<span class="${options.textClass} task-text--readonly">${escapeHtml(row.text)}</span>`;
+        const extra = options.renderExtra ? options.renderExtra(row) : "";
 
         return `
-          <li class="task-row">
+          <li class="${options.rowClass}">
             ${checkbox}
             ${text}
-            <a class="icon-link" href="${blockLink(row.openId)}" title="打开任务">打开</a>
+            ${extra}
           </li>
         `;
       })
       .join("");
+  }
 
+  function renderBoundTaskItem(item) {
+    const sourceLink = blockLink(item.source.sourceId);
+    const rows = renderTaskRows(item, item.rows, {
+      rowClass: "task-row",
+      textClass: "task-text",
+      renderExtra(row) {
+        return `<a class="icon-link" href="${blockLink(row.openId)}" title="打开任务">打开</a>`;
+      },
+    });
     const badgeClass = item.bound ? "task-card__badge" : "task-card__badge task-card__badge--warn";
     const badgeText = item.bound ? "任务笔记" : item.broken ? "链接失效" : "未绑定任务笔记";
     const titleLink = item.bound && item.targetId ? blockLink(item.targetId) : sourceLink;
@@ -558,13 +580,50 @@
     `;
   }
 
+  function renderUnboundTodoItem(item) {
+    const sourceLink = blockLink(item.source.sourceId);
+    return renderTaskRows(item, item.rows, {
+      rowClass: "unbound-row",
+      textClass: "task-text unbound-row__text",
+      renderExtra() {
+        return `
+          <span class="task-card__badge task-card__badge--warn">${item.broken ? "链接失效" : "未绑定"}</span>
+          <a class="icon-link" href="${sourceLink}" title="打开来源">打开</a>
+        `;
+      },
+    });
+  }
+
+  function renderTodoItem(item) {
+    return item.bound ? renderBoundTaskItem(item) : renderUnboundTodoItem(item);
+  }
+
   function renderGroups(groups) {
     state.rowMap.clear();
     els.result.innerHTML = groups
       .map((group) => {
         const collapsed = isGroupCollapsed(group.doc.id);
-        const tasks = group.items.map(renderTodoItem).join("");
-        const content = collapsed ? "" : `<div class="day__content"><ul class="tasks">${tasks}</ul></div>`;
+        const boundItems = group.items.filter((item) => item.bound);
+        const unboundItems = group.items.filter((item) => !item.bound);
+        const boundTasks = boundItems.map(renderTodoItem).join("");
+        const unboundTasks = unboundItems.map(renderTodoItem).join("");
+        const content = collapsed
+          ? ""
+          : `
+            <div class="day__content">
+              ${boundTasks ? `<ul class="tasks">${boundTasks}</ul>` : ""}
+              ${
+                unboundTasks
+                  ? `
+                    <section class="unbound-section">
+                      <div class="unbound-section__title">未绑定任务笔记</div>
+                      <ul class="unbound-list">${unboundTasks}</ul>
+                    </section>
+                  `
+                  : ""
+              }
+            </div>
+          `;
 
         return `
           <article class="day" data-doc-id="${escapeHtml(group.doc.id)}">
@@ -599,6 +658,8 @@
     try {
       await api.updateBlock(record.row.id, markdownForTask(record.row.text, nextChecked));
       record.row.checked = nextChecked;
+      record.row.task = true;
+      record.row.markdownKind = "task";
       setStatus("");
     } catch (error) {
       checkbox.checked = previousChecked;
@@ -607,6 +668,18 @@
       checkbox.disabled = false;
       state.savingRows.delete(key);
     }
+  }
+
+  function markdownForRow(row, text) {
+    if (row.task && row.markdownKind === "list" && !row.checked) {
+      return markdownForListItem(text);
+    }
+
+    if (row.task) {
+      return markdownForTask(text, row.checked);
+    }
+
+    return String(text || "").trim();
   }
 
   async function saveTaskText(element) {
@@ -638,8 +711,7 @@
     element.classList.add("is-saving");
 
     try {
-      const markdown = record.row.task ? markdownForTask(nextText, record.row.checked) : nextText;
-      await api.updateBlock(record.row.id, markdown);
+      await api.updateBlock(record.row.id, markdownForRow(record.row, nextText));
       record.row.text = nextText;
       element.dataset.originalText = nextText;
       element.textContent = nextText;
