@@ -13,6 +13,10 @@
 
   const state = {
     notebooks: [],
+    context: null,
+    groups: [],
+    rowMap: new Map(),
+    savingRows: new Set(),
   };
 
   function getApiBase() {
@@ -50,8 +54,24 @@
       return (await postApi("/query/sql", { stmt: statement })) || [];
     },
 
+    async getBlockById(blockId) {
+      const rows = await this.sql(
+        "select id, parent_id, root_id, box, path, hpath, name, content, markdown, type, subtype " +
+          `from blocks where id = '${sqlText(blockId)}' limit 1`
+      );
+      return rows[0] || null;
+    },
+
     async getChildBlocks(blockId) {
       return (await postApi("/block/getChildBlocks", { id: blockId })) || [];
+    },
+
+    async updateBlock(blockId, markdown) {
+      return postApi("/block/updateBlock", {
+        id: blockId,
+        dataType: "markdown",
+        data: markdown,
+      });
     },
   };
 
@@ -159,6 +179,44 @@
       .trim();
   }
 
+  function isTaskMarkdown(markdown) {
+    return /^\s*[-*+]\s+\[[ xX]\]\s+/.test(markdown || "");
+  }
+
+  function isTaskChecked(markdown) {
+    return /^\s*[-*+]\s+\[[xX]\]\s+/.test(markdown || "");
+  }
+
+  function taskTextFromMarkdown(markdown) {
+    return String(markdown || "")
+      .replace(/^\s*[-*+]\s+\[[ xX]\]\s+/, "")
+      .trim();
+  }
+
+  function markdownForTask(text, checked) {
+    return `- [${checked ? "x" : " "}] ${String(text || "").trim()}`;
+  }
+
+  function parseLinkedBlockId(markdown, sourceId) {
+    const text = String(markdown || "");
+    const patterns = [
+      /siyuan:\/\/blocks\/([A-Za-z0-9-]+)/g,
+      /\(\(([A-Za-z0-9-]+)(?:\s+["'][^"']*["'])?\)\)/g,
+    ];
+
+    for (const pattern of patterns) {
+      let match = pattern.exec(text);
+      while (match) {
+        if (match[1] && match[1] !== sourceId) {
+          return match[1];
+        }
+        match = pattern.exec(text);
+      }
+    }
+
+    return "";
+  }
+
   function flattenTodoItems(blocks) {
     const items = [];
     const seenIds = new Set();
@@ -188,9 +246,10 @@
       }
       seenTexts.add(textKey);
       items.push({
-        id: block.id,
-        text,
-        task,
+        sourceId: block.id,
+        sourceText: text,
+        sourceMarkdown: block.markdown || block.content || "",
+        sourceTask: task || isTaskMarkdown(block.markdown),
       });
     }
 
@@ -247,16 +306,129 @@
     const seenIds = new Set();
     const seenTexts = new Set();
     return items.filter((item) => {
-      const textKey = item.text.replace(/\s+/g, " ");
-      if ((item.id && seenIds.has(item.id)) || seenTexts.has(textKey)) {
+      const textKey = item.sourceText.replace(/\s+/g, " ");
+      if ((item.sourceId && seenIds.has(item.sourceId)) || seenTexts.has(textKey)) {
         return false;
       }
-      if (item.id) {
-        seenIds.add(item.id);
+      if (item.sourceId) {
+        seenIds.add(item.sourceId);
       }
       seenTexts.add(textKey);
       return true;
     });
+  }
+
+  function flattenTaskBlocks(blocks) {
+    const rows = [];
+    const seen = new Set();
+
+    function walk(items) {
+      for (const block of items || []) {
+        const markdown = block.markdown || block.content || "";
+        if (block.id && !seen.has(block.id) && isTaskMarkdown(markdown)) {
+          seen.add(block.id);
+          rows.push(createTaskRow(block));
+        }
+        walk(block.children || []);
+      }
+    }
+
+    walk(blocks);
+    return rows;
+  }
+
+  function blockTitle(block) {
+    return textFromBlock(block) || stripSySuffix(block.content || block.name || block.hpath || "") || block.id;
+  }
+
+  function createTaskRow(block) {
+    const markdown = block.markdown || block.content || "";
+    const task = isTaskMarkdown(markdown);
+    return {
+      id: block.id,
+      type: block.type,
+      text: task ? taskTextFromMarkdown(markdown) : textFromBlock(block),
+      checked: task && isTaskChecked(markdown),
+      task,
+      editable: block.type !== "d",
+      openId: block.id,
+    };
+  }
+
+  async function buildBoundTodoItem(sourceItem, targetId) {
+    const target = await api.getBlockById(targetId);
+    if (!target) {
+      return {
+        source: sourceItem,
+        bound: false,
+        broken: true,
+        targetId,
+        title: "任务链接失效",
+        rows: [],
+      };
+    }
+
+    let rows = [];
+    if (isTaskMarkdown(target.markdown || target.content || "")) {
+      rows = [createTaskRow(target)];
+    } else {
+      try {
+        const children = await readBlockTree(target.id, 4);
+        rows = flattenTaskBlocks(children);
+      } catch (error) {
+        rows = [];
+      }
+    }
+
+    if (!rows.length) {
+      rows = [createTaskRow(target)];
+    }
+
+    return {
+      source: sourceItem,
+      bound: true,
+      broken: false,
+      targetId,
+      title: blockTitle(target),
+      rows,
+    };
+  }
+
+  async function buildTodoItem(sourceItem) {
+    const targetId = parseLinkedBlockId(sourceItem.sourceMarkdown, sourceItem.sourceId);
+    if (!targetId) {
+      return {
+        source: sourceItem,
+        bound: false,
+        broken: false,
+        targetId: "",
+        title: "未绑定任务笔记",
+        rows: [
+          {
+            id: sourceItem.sourceId,
+            text: sourceItem.sourceText,
+            task: false,
+            checked: false,
+            editable: false,
+            openId: sourceItem.sourceId,
+          },
+        ],
+      };
+    }
+
+    try {
+      return await buildBoundTodoItem(sourceItem, targetId);
+    } catch (error) {
+      return {
+        source: sourceItem,
+        bound: false,
+        broken: true,
+        targetId,
+        title: "任务读取失败",
+        error: error.message,
+        rows: [],
+      };
+    }
   }
 
   async function collectTodos(notebookId, monthText, targetTitle) {
@@ -276,11 +448,17 @@
         items.push(...flattenTodoItems(children));
       }
 
-      if (items.length) {
+      const sourceItems = dedupeTodoItems(items);
+      const todoItems = [];
+      for (const sourceItem of sourceItems) {
+        todoItems.push(await buildTodoItem(sourceItem));
+      }
+
+      if (todoItems.length) {
         groups.push({
           doc,
           title: stripSySuffix(doc.content),
-          items: dedupeTodoItems(items),
+          items: todoItems,
         });
       }
     }
@@ -307,31 +485,219 @@
     return `siyuan://blocks/${encodeURIComponent(blockId)}`;
   }
 
-  function renderGroups(groups) {
-    els.result.innerHTML = groups
-      .map((group) => {
-        const tasks = group.items
-          .map((item) => {
-            return `
-              <li class="task-item">
-                <input class="task-checkbox" type="checkbox" disabled>
-                <a class="task-link" href="${blockLink(item.id)}" title="打开原块">${escapeHtml(item.text)}</a>
-              </li>
-            `;
-          })
-          .join("");
+  function collapseStorageKey(docId) {
+    const context = state.context || {};
+    return [
+      "monthly-todo-widget",
+      "collapsed",
+      context.notebookId || "",
+      context.monthText || "",
+      context.targetTitle || "",
+      docId,
+    ].join(":");
+  }
+
+  function isGroupCollapsed(docId) {
+    return localStorage.getItem(collapseStorageKey(docId)) === "1";
+  }
+
+  function setGroupCollapsed(docId, collapsed) {
+    const key = collapseStorageKey(docId);
+    if (collapsed) {
+      localStorage.setItem(key, "1");
+    } else {
+      localStorage.removeItem(key);
+    }
+  }
+
+  function rowKey(sourceId, rowId) {
+    return `${sourceId || ""}:${rowId || ""}`;
+  }
+
+  function renderTodoItem(item) {
+    const sourceLink = blockLink(item.source.sourceId);
+    const rows = item.rows
+      .map((row) => {
+        const key = rowKey(item.source.sourceId, row.id);
+        state.rowMap.set(key, { item, row });
+
+        const checkbox = row.task
+          ? `<input class="task-checkbox" type="checkbox" data-row-key="${escapeHtml(key)}" ${row.checked ? "checked" : ""}>`
+          : '<span class="task-checkbox-spacer" aria-hidden="true"></span>';
+        const text = row.editable
+          ? `<span class="task-text" contenteditable="true" spellcheck="false" data-row-key="${escapeHtml(key)}">${escapeHtml(row.text)}</span>`
+          : `<span class="task-text task-text--readonly">${escapeHtml(row.text)}</span>`;
 
         return `
-          <article class="day">
+          <li class="task-row">
+            ${checkbox}
+            ${text}
+            <a class="icon-link" href="${blockLink(row.openId)}" title="打开任务">打开</a>
+          </li>
+        `;
+      })
+      .join("");
+
+    const badgeClass = item.bound ? "task-card__badge" : "task-card__badge task-card__badge--warn";
+    const badgeText = item.bound ? "任务笔记" : item.broken ? "链接失效" : "未绑定任务笔记";
+    const titleLink = item.bound && item.targetId ? blockLink(item.targetId) : sourceLink;
+    const error = item.error ? `<div class="task-card__error">${escapeHtml(item.error)}</div>` : "";
+
+    return `
+      <li class="task-card">
+        <div class="task-card__head">
+          <a class="task-card__title" href="${titleLink}" title="${item.bound ? "打开任务笔记/任务块" : "打开日记 TODO 条目"}">${escapeHtml(item.title)}</a>
+          <span class="${badgeClass}">${badgeText}</span>
+        </div>
+        ${rows ? `<ul class="task-rows">${rows}</ul>` : ""}
+        ${error}
+        <div class="task-card__source">
+          来源：<a href="${sourceLink}" title="打开原日记 TODO 条目">${escapeHtml(item.source.sourceText)}</a>
+        </div>
+      </li>
+    `;
+  }
+
+  function renderGroups(groups) {
+    state.rowMap.clear();
+    els.result.innerHTML = groups
+      .map((group) => {
+        const collapsed = isGroupCollapsed(group.doc.id);
+        const tasks = group.items.map(renderTodoItem).join("");
+        const content = collapsed ? "" : `<div class="day__content"><ul class="tasks">${tasks}</ul></div>`;
+
+        return `
+          <article class="day" data-doc-id="${escapeHtml(group.doc.id)}">
             <h2 class="day__title">
               <span>${escapeHtml(group.title)}</span>
-              <a href="${blockLink(group.doc.id)}" title="打开日记文档">打开</a>
+              <span class="day__actions">
+                <a href="${blockLink(group.doc.id)}" title="打开日记文档">打开</a>
+                <button class="link-button" type="button" data-action="toggle-day" data-doc-id="${escapeHtml(group.doc.id)}">
+                  ${collapsed ? "展开" : "折叠"}
+                </button>
+              </span>
             </h2>
-            <ul class="tasks">${tasks}</ul>
+            ${content}
           </article>
         `;
       })
       .join("");
+  }
+
+  async function updateTaskChecked(checkbox) {
+    const key = checkbox.dataset.rowKey;
+    const record = state.rowMap.get(key);
+    if (!record || !record.row.task || state.savingRows.has(key)) {
+      return;
+    }
+
+    const nextChecked = checkbox.checked;
+    const previousChecked = record.row.checked;
+    state.savingRows.add(key);
+    checkbox.disabled = true;
+
+    try {
+      await api.updateBlock(record.row.id, markdownForTask(record.row.text, nextChecked));
+      record.row.checked = nextChecked;
+      setStatus("");
+    } catch (error) {
+      checkbox.checked = previousChecked;
+      setStatus(`勾选同步失败：${error.message}`);
+    } finally {
+      checkbox.disabled = false;
+      state.savingRows.delete(key);
+    }
+  }
+
+  async function saveTaskText(element) {
+    const key = element.dataset.rowKey;
+    const record = state.rowMap.get(key);
+    if (!record || !record.row.editable || state.savingRows.has(key)) {
+      return;
+    }
+
+    const previousText = element.dataset.originalText || record.row.text;
+    const nextText = element.textContent.trim();
+    if (element.dataset.cancelEdit === "1") {
+      element.dataset.cancelEdit = "";
+      element.textContent = previousText;
+      return;
+    }
+
+    if (nextText === previousText) {
+      return;
+    }
+
+    if (!nextText) {
+      element.textContent = previousText;
+      setStatus("任务内容不能为空。");
+      return;
+    }
+
+    state.savingRows.add(key);
+    element.classList.add("is-saving");
+
+    try {
+      const markdown = record.row.task ? markdownForTask(nextText, record.row.checked) : nextText;
+      await api.updateBlock(record.row.id, markdown);
+      record.row.text = nextText;
+      element.dataset.originalText = nextText;
+      element.textContent = nextText;
+      setStatus("");
+    } catch (error) {
+      element.textContent = previousText;
+      setStatus(`内容保存失败：${error.message}`);
+    } finally {
+      element.classList.remove("is-saving");
+      state.savingRows.delete(key);
+    }
+  }
+
+  function handleResultClick(event) {
+    const toggle = event.target.closest('[data-action="toggle-day"]');
+    if (!toggle) {
+      return;
+    }
+
+    const docId = toggle.dataset.docId;
+    setGroupCollapsed(docId, !isGroupCollapsed(docId));
+    renderGroups(state.groups);
+  }
+
+  function handleResultChange(event) {
+    if (event.target.classList.contains("task-checkbox")) {
+      updateTaskChecked(event.target);
+    }
+  }
+
+  function handleResultFocusIn(event) {
+    if (event.target.classList.contains("task-text")) {
+      event.target.dataset.originalText = event.target.textContent.trim();
+      event.target.dataset.cancelEdit = "";
+    }
+  }
+
+  function handleResultFocusOut(event) {
+    if (event.target.classList.contains("task-text")) {
+      saveTaskText(event.target);
+    }
+  }
+
+  function handleResultKeyDown(event) {
+    if (!event.target.classList.contains("task-text")) {
+      return;
+    }
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      event.target.blur();
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.target.dataset.cancelEdit = "1";
+      event.target.blur();
+    }
   }
 
   function setStatus(message) {
@@ -371,6 +737,12 @@
     const notebookId = els.notebook.value;
     const monthText = normalizeMonthText(els.month.value);
     const targetTitle = els.heading.value.trim() || "TODO";
+    state.context = {
+      notebookId,
+      monthText,
+      targetTitle,
+    };
+    state.groups = [];
 
     if (!notebookId) {
       setStatus("未选择笔记本。");
@@ -399,6 +771,7 @@
       }
 
       setStatus("");
+      state.groups = summary.groups;
       renderGroups(summary.groups);
     } catch (error) {
       setStatus(error.message);
@@ -409,6 +782,11 @@
 
   function bindEvents() {
     els.form.addEventListener("submit", handleRefresh);
+    els.result.addEventListener("click", handleResultClick);
+    els.result.addEventListener("change", handleResultChange);
+    els.result.addEventListener("focusin", handleResultFocusIn);
+    els.result.addEventListener("focusout", handleResultFocusOut);
+    els.result.addEventListener("keydown", handleResultKeyDown);
   }
 
   function init() {
