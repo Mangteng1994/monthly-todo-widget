@@ -139,26 +139,14 @@ button:disabled {
   list-style: none;
 }
 
-.unbound-section {
-  padding: 8px 10px;
-  border-top: 1px solid var(--border);
-}
-
-.tasks + .unbound-section {
-  padding-top: 9px;
-}
-
-.unbound-section__title {
-  margin-bottom: 5px;
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 600;
-}
-
 .unbound-list {
   margin: 0;
-  padding: 0;
+  padding: 8px 10px;
   list-style: none;
+}
+
+.tasks + .unbound-list {
+  border-top: 1px solid var(--border);
 }
 
 .task-card {

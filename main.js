@@ -560,8 +560,8 @@
         return `<a class="icon-link" href="${blockLink(row.openId)}" title="打开任务">打开</a>`;
       },
     });
-    const badgeClass = item.bound ? "task-card__badge" : "task-card__badge task-card__badge--warn";
-    const badgeText = item.bound ? "任务笔记" : item.broken ? "链接失效" : "未绑定任务笔记";
+    const badgeClass = "task-card__badge";
+    const badgeText = "任务笔记";
     const titleLink = item.bound && item.targetId ? blockLink(item.targetId) : sourceLink;
     const error = item.error ? `<div class="task-card__error">${escapeHtml(item.error)}</div>` : "";
 
@@ -586,8 +586,11 @@
       rowClass: "unbound-row",
       textClass: "task-text unbound-row__text",
       renderExtra() {
+        const brokenBadge = item.broken
+          ? '<span class="task-card__badge task-card__badge--warn">链接失效</span>'
+          : "";
         return `
-          <span class="task-card__badge task-card__badge--warn">${item.broken ? "链接失效" : "未绑定"}</span>
+          ${brokenBadge}
           <a class="icon-link" href="${sourceLink}" title="打开来源">打开</a>
         `;
       },
@@ -614,12 +617,7 @@
               ${boundTasks ? `<ul class="tasks">${boundTasks}</ul>` : ""}
               ${
                 unboundTasks
-                  ? `
-                    <section class="unbound-section">
-                      <div class="unbound-section__title">未绑定任务笔记</div>
-                      <ul class="unbound-list">${unboundTasks}</ul>
-                    </section>
-                  `
+                  ? `<ul class="unbound-list">${unboundTasks}</ul>`
                   : ""
               }
             </div>
