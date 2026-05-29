@@ -73,8 +73,12 @@
     return new RegExp(`^${escapedMonth}-\\d{2}\\b`).test(title);
   }
 
+  function dailyDocSortTitle(doc) {
+    return stripSySuffix(doc.content || doc.name || doc.hpath || "");
+  }
+
   function compareDailyDoc(a, b) {
-    return stripSySuffix(b.content).localeCompare(stripSySuffix(a.content), "zh-Hans");
+    return dailyDocSortTitle(a).localeCompare(dailyDocSortTitle(b), "zh-Hans");
   }
 
   async function findMonthDocs(notebookId, monthText) {
@@ -155,33 +159,104 @@
       .trim();
   }
 
-  function flattenTodoItems(blocks, parentIsUnorderedList) {
+  function flattenTodoItems(blocks) {
     const items = [];
+    const seenIds = new Set();
+    const seenTexts = new Set();
 
-    for (const block of blocks) {
-      const isList = block.type === "l";
-      const isUnorderedList = isList && (block.subType === "u" || block.subtype === "u");
-      const isListItem = block.type === "i";
-      const text = textFromBlock(block);
-
-      if (isListItem && parentIsUnorderedList && text) {
-        items.push({
-          id: block.id,
-          text,
-          task: true,
-        });
-      } else if (!isList && !isListItem && text) {
-        items.push({
-          id: block.id,
-          text,
-          task: false,
-        });
-      }
-
-      items.push(...flattenTodoItems(block.children || [], isUnorderedList));
+    function isUnorderedList(block) {
+      return block.type === "l" && (block.subType === "u" || block.subtype === "u");
     }
 
+    function isListItem(block) {
+      return block.type === "i";
+    }
+
+    function addItem(block, task) {
+      const text = textFromBlock(block);
+      if (!text) {
+        return;
+      }
+
+      const textKey = text.replace(/\s+/g, " ");
+      if ((block.id && seenIds.has(block.id)) || seenTexts.has(textKey)) {
+        return;
+      }
+
+      if (block.id) {
+        seenIds.add(block.id);
+      }
+      seenTexts.add(textKey);
+      items.push({
+        id: block.id,
+        text,
+        task,
+      });
+    }
+
+    function directTextChildren(block) {
+      return (block.children || []).filter((child) => {
+        return !isUnorderedList(child) && !isListItem(child) && textFromBlock(child);
+      });
+    }
+
+    function walk(blocksToRead, parentIsUnorderedList) {
+      for (const block of blocksToRead) {
+        const text = textFromBlock(block);
+
+        if (isUnorderedList(block)) {
+          walk(block.children || [], true);
+          continue;
+        }
+
+        if (isListItem(block)) {
+          if (parentIsUnorderedList) {
+            const textChildren = directTextChildren(block);
+            if (textChildren.length) {
+              for (const child of textChildren) {
+                addItem(child, true);
+              }
+            } else {
+              addItem(block, true);
+            }
+
+            walk(
+              (block.children || []).filter((child) => isUnorderedList(child)),
+              false
+            );
+          } else {
+            walk(block.children || [], false);
+          }
+          continue;
+        }
+
+        if (text) {
+          addItem(block, false);
+          continue;
+        }
+
+        walk(block.children || [], false);
+      }
+    }
+
+    walk(blocks || [], false);
     return items;
+  }
+
+  function dedupeTodoItems(items) {
+    const seenIds = new Set();
+    const seenTexts = new Set();
+    return items.filter((item) => {
+      const textKey = item.text.replace(/\s+/g, " ");
+      if ((item.id && seenIds.has(item.id)) || seenTexts.has(textKey)) {
+        return false;
+      }
+      if (item.id) {
+        seenIds.add(item.id);
+      }
+      seenTexts.add(textKey);
+      return true;
+    });
   }
 
   async function collectTodos(notebookId, monthText, targetTitle) {
@@ -198,14 +273,14 @@
 
       for (const heading of headings) {
         const children = await readBlockTree(heading.id, 6);
-        items.push(...flattenTodoItems(children, false));
+        items.push(...flattenTodoItems(children));
       }
 
       if (items.length) {
         groups.push({
           doc,
           title: stripSySuffix(doc.content),
-          items,
+          items: dedupeTodoItems(items),
         });
       }
     }
@@ -237,8 +312,12 @@
       .map((group) => {
         const tasks = group.items
           .map((item) => {
-            const marker = item.task ? '<input type="checkbox" disabled /> ' : "";
-            return `<li>${marker}<a href="${blockLink(item.id)}" title="打开原块">${escapeHtml(item.text)}</a></li>`;
+            return `
+              <li class="task-item">
+                <input class="task-checkbox" type="checkbox" disabled>
+                <a class="task-link" href="${blockLink(item.id)}" title="打开原块">${escapeHtml(item.text)}</a>
+              </li>
+            `;
           })
           .join("");
 
