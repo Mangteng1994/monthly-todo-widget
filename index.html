@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>月度 TODO 汇总</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="widget">
+      <form class="toolbar" id="summaryForm">
+        <label class="field">
+          <span>笔记本</span>
+          <select id="notebookSelect">
+            <option value="">加载中...</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>月份文档</span>
+          <input id="monthInput" type="text" placeholder="2026-05" autocomplete="off" />
+        </label>
+
+        <label class="field">
+          <span>目标标题</span>
+          <input id="headingInput" type="text" value="TODO" autocomplete="off" />
+        </label>
+
+        <button id="refreshButton" type="submit">刷新汇总</button>
+      </form>
+
+      <section id="status" class="status" role="status">请选择笔记本和月份文档后刷新。</section>
+      <section id="result" class="result" aria-live="polite"></section>
+    </main>
+
+    <script src="./main.js"></script>
+  </body>
+</html>
