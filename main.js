@@ -46,16 +46,6 @@
       return (data && data.notebooks ? data.notebooks : []).filter((item) => !item.closed);
     },
 
-    async listDocsByPath(notebookId, path) {
-      const data = await postApi("/filetree/listDocsByPath", {
-        notebook: notebookId,
-        path,
-        sort: 0,
-        maxListCount: 1024,
-      });
-      return data && data.files ? data.files : [];
-    },
-
     async sql(statement) {
       return (await postApi("/query/sql", { stmt: statement })) || [];
     },
@@ -65,9 +55,8 @@
     },
   };
 
-  function normalizeDocPath(value) {
-    const path = value.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-    return path ? `/${path}` : "";
+  function normalizeMonthText(value) {
+    return value.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
   }
 
   function sqlText(value) {
@@ -79,13 +68,60 @@
   }
 
   function isDailyDoc(doc, monthText) {
-    const title = stripSySuffix(doc.name || doc.hPath || doc.path || "");
+    const title = stripSySuffix(doc.content || doc.name || doc.hpath || "");
     const escapedMonth = monthText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`^${escapedMonth}-\\d{2}\\b`).test(title);
   }
 
   function compareDailyDoc(a, b) {
-    return stripSySuffix(b.name).localeCompare(stripSySuffix(a.name), "zh-Hans");
+    return stripSySuffix(b.content).localeCompare(stripSySuffix(a.content), "zh-Hans");
+  }
+
+  async function findMonthDocs(notebookId, monthText) {
+    const box = sqlText(notebookId);
+    const title = sqlText(monthText);
+    const hpathEndsWith = sqlText(`/${monthText}`);
+
+    return api.sql(
+      "select id, box, content, hpath from blocks " +
+        `where type = 'd' and box = '${box}' ` +
+        `and (content = '${title}' or hpath like '%${hpathEndsWith}') ` +
+        "order by hpath"
+    );
+  }
+
+  async function findDailyDocs(notebookId, monthText) {
+    const monthDocs = await findMonthDocs(notebookId, monthText);
+    if (!monthDocs.length) {
+      return [];
+    }
+
+    const dateDocs = [];
+    const seen = new Set();
+
+    for (const monthDoc of monthDocs) {
+      const monthHPath = String(monthDoc.hpath || "").replace(/\/+$/, "");
+      if (!monthHPath) {
+        continue;
+      }
+
+      const likePattern = sqlText(`${monthHPath}/%`);
+      const docs = await api.sql(
+        "select id, box, content, hpath from blocks " +
+          `where type = 'd' and box = '${sqlText(notebookId)}' ` +
+          `and hpath like '${likePattern}' order by hpath`
+      );
+
+      for (const doc of docs) {
+        if (!doc.id || seen.has(doc.id) || !isDailyDoc(doc, monthText)) {
+          continue;
+        }
+        seen.add(doc.id);
+        dateDocs.push(doc);
+      }
+    }
+
+    return dateDocs.sort(compareDailyDoc);
   }
 
   async function findHeadingBlocks(dateDoc, targetTitle) {
@@ -94,7 +130,7 @@
     return api.sql(
       "select id, root_id, content, markdown from blocks " +
         `where root_id = '${rootId}' and type = 'h' ` +
-        `and (content = '${title}' or markdown = '${title}') order by sort`
+        `and content = '${title}' order by sort`
     );
   }
 
@@ -148,11 +184,8 @@
     return items;
   }
 
-  async function collectTodos(notebookId, monthPath, targetTitle) {
-    const monthText = monthPath.split("/").pop();
-    const docs = (await api.listDocsByPath(notebookId, monthPath))
-      .filter((doc) => doc.id && isDailyDoc(doc, monthText))
-      .sort(compareDailyDoc);
+  async function collectTodos(notebookId, monthText, targetTitle) {
+    const docs = await findDailyDocs(notebookId, monthText);
 
     if (!docs.length) {
       return { reason: "no-daily-docs", groups: [] };
@@ -171,7 +204,7 @@
       if (items.length) {
         groups.push({
           doc,
-          title: stripSySuffix(doc.name),
+          title: stripSySuffix(doc.content),
           items,
         });
       }
@@ -257,7 +290,7 @@
     els.result.innerHTML = "";
 
     const notebookId = els.notebook.value;
-    const monthPath = normalizeDocPath(els.month.value);
+    const monthText = normalizeMonthText(els.month.value);
     const targetTitle = els.heading.value.trim() || "TODO";
 
     if (!notebookId) {
@@ -265,7 +298,7 @@
       return;
     }
 
-    if (!monthPath) {
+    if (!monthText) {
       setStatus("未选择月份文档。");
       return;
     }
@@ -274,7 +307,7 @@
     setStatus("正在读取日期文档...");
 
     try {
-      const summary = await collectTodos(notebookId, monthPath, targetTitle);
+      const summary = await collectTodos(notebookId, monthText, targetTitle);
 
       if (summary.reason === "no-daily-docs") {
         setStatus("当前月份未找到日期文档。");
