@@ -231,6 +231,7 @@ button:disabled {
   align-items: flex-start;
   gap: 7px;
   margin: 4px 0;
+  padding-left: var(--indent, 0);
   min-width: 0;
 }
 

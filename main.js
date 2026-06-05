@@ -171,13 +171,30 @@
   }
 
   function textFromBlock(block) {
-    const raw = block.markdown || block.content || "";
-    return raw
+    return cleanTaskText(block.markdown || block.content || "");
+  }
+
+  function stripTaskPrefix(value) {
+    return String(value || "")
       .replace(/^\s*>\s*/, "")
       .replace(/^\s*[-*+]\s+/, "")
       .replace(/^\s*\d+\.\s+/, "")
       .replace(/^\s*\[[ xX]\]\s+/, "")
       .trim();
+  }
+
+  function cleanTaskText(value) {
+    return String(value || "")
+      .split(/\r?\n/)
+      .map(stripTaskPrefix)
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+
+  function firstTaskText(value) {
+    const lines = cleanTaskText(value).split(/\r?\n/).filter(Boolean);
+    return lines[0] || "";
   }
 
   function isTaskMarkdown(markdown) {
@@ -189,17 +206,15 @@
   }
 
   function taskTextFromMarkdown(markdown) {
-    return String(markdown || "")
-      .replace(/^\s*[-*+]\s+\[[ xX]\]\s+/, "")
-      .trim();
+    return firstTaskText(markdown);
   }
 
   function markdownForTask(text, checked) {
-    return `- [${checked ? "x" : " "}] ${String(text || "").trim()}`;
+    return `- [${checked ? "x" : " "}] ${firstTaskText(text)}`;
   }
 
   function markdownForListItem(text) {
-    return `- ${String(text || "").trim()}`;
+    return `- ${firstTaskText(text)}`;
   }
 
   function parseLinkedBlockId(markdown, sourceId) {
@@ -240,9 +255,12 @@
       return /^\s*>/.test(block.markdown || block.content || "");
     }
 
-    function addItem(block, textBlock, target) {
+    function addItem(block, textBlock, target, depth) {
       const textBlocks = Array.isArray(textBlock) ? textBlock : [textBlock || block];
-      const text = textBlocks.map(textFromBlock).filter(Boolean).join("\n");
+      const text = textBlocks
+        .map((item) => firstTaskText(item.markdown || item.content || ""))
+        .filter(Boolean)
+        .join("\n");
       if (!text) {
         return;
       }
@@ -263,6 +281,7 @@
           .concat(textBlocks.map((item) => item.markdown || item.content || ""))
           .filter(Boolean)
           .join("\n"),
+        sourceDepth: Math.max(Number(depth) || 0, 0),
         sourceTask: isTaskMarkdown(block.markdown || block.content || ""),
         sourceChecked: isTaskChecked(block.markdown || block.content || ""),
       });
@@ -274,39 +293,38 @@
       });
     }
 
-    function walk(blocksToRead, parentIsUnorderedList) {
+    function walk(blocksToRead, parentIsUnorderedList, depth) {
       for (const block of blocksToRead) {
         const text = textFromBlock(block);
 
         if (isUnorderedList(block)) {
-          walk(block.children || [], true);
+          walk(block.children || [], true, depth);
           continue;
         }
 
         if (isListItem(block)) {
           if (parentIsUnorderedList) {
             const textChildren = directTextChildren(block);
-            addItem(block, textChildren.length ? textChildren : block, listItems);
+            addItem(block, textChildren.length ? textChildren : block, listItems, depth);
 
-            walk(
-              (block.children || []).filter((child) => isUnorderedList(child)),
-              false
-            );
+            for (const child of (block.children || []).filter((item) => isUnorderedList(item))) {
+              walk(child.children || [], true, depth + 1);
+            }
           } else {
-            walk(block.children || [], false);
+            walk(block.children || [], false, depth);
           }
           continue;
         }
 
         if (text && !parentIsUnorderedList && !isBlockQuote(block)) {
-          addItem(block, block, fallbackItems);
+          addItem(block, block, fallbackItems, 0);
         }
 
-        walk(block.children || [], false);
+        walk(block.children || [], false, depth);
       }
     }
 
-    walk(blocks || [], false);
+    walk(blocks || [], false, 0);
     return listItems.length ? listItems : fallbackItems;
   }
 
@@ -315,6 +333,9 @@
     const seenTexts = new Set();
     return items.filter((item) => {
       const textKey = item.sourceText.replace(/\s+/g, " ");
+      if (isGuideText(item.sourceText)) {
+        return false;
+      }
       if ((item.sourceId && seenIds.has(item.sourceId)) || seenTexts.has(textKey)) {
         return false;
       }
@@ -324,6 +345,26 @@
       seenTexts.add(textKey);
       return true;
     });
+  }
+
+  function normalizeTodoDepths(items) {
+    const minDepth = items.reduce((lowest, item) => {
+      const depth = Math.max(Number(item.sourceDepth) || 0, 0);
+      return Math.min(lowest, depth);
+    }, Infinity);
+
+    if (!Number.isFinite(minDepth) || minDepth <= 0) {
+      return items;
+    }
+
+    return items.map((item) => ({
+      ...item,
+      sourceDepth: Math.max((Number(item.sourceDepth) || 0) - minDepth, 0),
+    }));
+  }
+
+  function isGuideText(text) {
+    return /日记只是一个快速索引/.test(text || "");
   }
 
   function flattenTaskBlocks(blocks) {
@@ -368,10 +409,12 @@
     return {
       id: sourceItem.sourceId,
       text: sourceItem.sourceText,
+      depth: sourceItem.sourceDepth || 0,
       checked: sourceItem.sourceChecked,
       task: true,
-      markdownKind: sourceItem.sourceTask ? "task" : "list",
-      editable: true,
+      markdownKind: "plain",
+      editable: false,
+      localOnly: true,
       openId: sourceItem.sourceId,
     };
   }
@@ -460,7 +503,7 @@
         items.push(...flattenTodoItems(children));
       }
 
-      const sourceItems = dedupeTodoItems(items);
+      const sourceItems = normalizeTodoDepths(dedupeTodoItems(items));
       const todoItems = [];
       for (const sourceItem of sourceItems) {
         todoItems.push(await buildTodoItem(sourceItem));
@@ -530,6 +573,7 @@
     return rows
       .map((row) => {
         const key = rowKey(item.source.sourceId, row.id);
+        const depth = Math.max(Number(row.depth) || 0, 0);
         state.rowMap.set(key, { item, row });
 
         const checkbox = row.task
@@ -541,7 +585,7 @@
         const extra = options.renderExtra ? options.renderExtra(row) : "";
 
         return `
-          <li class="${options.rowClass}">
+          <li class="${options.rowClass}" style="--indent: ${depth * 18}px">
             ${checkbox}
             ${text}
             ${extra}
@@ -650,6 +694,12 @@
 
     const nextChecked = checkbox.checked;
     const previousChecked = record.row.checked;
+    if (record.row.localOnly) {
+      record.row.checked = nextChecked;
+      setStatus("");
+      return;
+    }
+
     state.savingRows.add(key);
     checkbox.disabled = true;
 
@@ -786,6 +836,11 @@
       option.value = notebook.id;
       option.textContent = notebook.name;
       els.notebook.appendChild(option);
+    }
+
+    const dailyNote = state.notebooks.find((notebook) => notebook.name === "Dailynote");
+    if (dailyNote) {
+      els.notebook.value = dailyNote.id;
     }
   }
 
